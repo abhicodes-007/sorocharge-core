@@ -1,0 +1,14 @@
+[package]
+name = "sorocharge-x402"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "x402 wire-format adapter for sorocharge-signer: build/sign/retry as a payer, verify/settle as a facilitator"
+
+[dependencies]
+sorocharge-signer = { path = "../sorocharge-signer" }
+stellar-rpc-client = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sorocharge-signer",
+    "crates/sorocharge-x402",
+    "crates/sorocharge-mpp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98.1"
+license = "Apache-2.0"
+repository = "https://github.com/sorocharge/sorocharge-core"
+
+[workspace.dependencies]
+stellar-xdr = { version = "=28.0.0", features = ["std", "serde"] }
+stellar-strkey = { version = "=0.0.18" }
+stellar-rpc-client = { version = "=28.0.0" }
+ed25519-dalek = { version = "=3.0.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
