@@ -3,5 +3,5 @@
 mod entry;
 mod error;
 
-pub use entry::{Address, ChargeParams, CredentialKind};
+pub use entry::{build_charge_entry, Address, ChargeParams, CredentialKind, UnsignedEntry};
 pub use error::SorochargeError;

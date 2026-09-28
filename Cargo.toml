@@ -14,9 +14,10 @@ license = "Apache-2.0"
 repository = "https://github.com/sorocharge/sorocharge-core"
 
 [workspace.dependencies]
-stellar-xdr = { version = "=28.0.0", features = ["std", "serde"] }
+stellar-xdr = { version = "=28.0.0", features = ["std", "serde", "base64"] }
 stellar-strkey = { version = "=0.0.18" }
 stellar-rpc-client = { version = "=28.0.0" }
 ed25519-dalek = { version = "=3.0.0" }
+getrandom = { version = "=0.4.3" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }

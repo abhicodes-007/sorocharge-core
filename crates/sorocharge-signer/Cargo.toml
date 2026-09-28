@@ -11,4 +11,8 @@ description = "Shared engine for building, signing, and verifying Soroban author
 stellar-xdr = { workspace = true }
 stellar-strkey = { workspace = true }
 ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
