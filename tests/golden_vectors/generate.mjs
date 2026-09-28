@@ -67,6 +67,21 @@ function buildLegacyEntry() {
   });
 }
 
+function buildAddressV2Entry() {
+  const addressCredentials = new xdr.SorobanAddressCredentials({
+    address: new Address(payer).toScAddress(),
+    nonce,
+    signatureExpirationLedger: validUntilLedger,
+    signature: xdr.ScVal.scvVec([]),
+  });
+
+  return new xdr.SorobanAuthorizationEntry({
+    credentials:
+      xdr.SorobanCredentials.sorobanCredentialsAddressV2(addressCredentials),
+    rootInvocation: buildTransferInvocation(),
+  });
+}
+
 function writeFixture(name, entry) {
   const fixture = {
     description: `${name}: unsigned SorobanAuthorizationEntry for a SEP-41 transfer`,
@@ -85,3 +100,4 @@ function writeFixture(name, entry) {
 }
 
 writeFixture("legacy_transfer", buildLegacyEntry());
+writeFixture("address_v2_transfer", buildAddressV2Entry());

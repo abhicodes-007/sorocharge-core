@@ -83,6 +83,18 @@ fn empty_signature_placeholder() -> ScVal {
     ScVal::Vec(Some(ScVec(VecM::default())))
 }
 
+/// Builds the `SorobanAddressCredentials` payload shared by `Legacy` and
+/// `AddressV2`: the two credential kinds carry an identical struct and
+/// differ only in which `SorobanCredentials` union arm wraps it.
+fn build_address_credentials(params: &ChargeParams, nonce: i64) -> SorobanAddressCredentials {
+    SorobanAddressCredentials {
+        address: params.payer.clone(),
+        nonce,
+        signature_expiration_ledger: params.valid_until_ledger,
+        signature: empty_signature_placeholder(),
+    }
+}
+
 /// Builds the `InvokeContractArgs` for a SEP-41 `transfer(from, to, amount)`
 /// call, the single invocation every charge entry this library produces
 /// authorizes.
@@ -167,15 +179,12 @@ pub(crate) fn build_charge_entry_with_nonce(
 
     let credentials = match credential {
         CredentialKind::Legacy => {
-            let address_credentials = SorobanAddressCredentials {
-                address: params.payer.clone(),
-                nonce,
-                signature_expiration_ledger: params.valid_until_ledger,
-                signature: empty_signature_placeholder(),
-            };
-            SorobanCredentials::Address(address_credentials)
+            SorobanCredentials::Address(build_address_credentials(params, nonce))
         }
-        CredentialKind::AddressV2 | CredentialKind::Delegated { .. } => {
+        CredentialKind::AddressV2 => {
+            SorobanCredentials::AddressV2(build_address_credentials(params, nonce))
+        }
+        CredentialKind::Delegated { .. } => {
             return Err(SorochargeError::UnsupportedCredentialType);
         }
     };
@@ -252,6 +261,42 @@ mod golden_vector_tests {
         assert_eq!(
             actual_bytes, expected_bytes,
             "sorocharge-signer's unsigned entry XDR must be byte-identical to @stellar/stellar-sdk 17.2.0's output"
+        );
+    }
+
+    #[test]
+    fn address_v2_transfer_matches_reference_sdk_byte_for_byte() {
+        let fixture = load_fixture("address_v2_transfer");
+
+        let params = ChargeParams {
+            asset_contract: fixture.asset_contract.parse::<ScAddress>().unwrap(),
+            amount: fixture.amount.parse().unwrap(),
+            payer: fixture.payer.parse::<ScAddress>().unwrap(),
+            recipient: fixture.recipient.parse::<ScAddress>().unwrap(),
+            valid_until_ledger: fixture.valid_until_ledger,
+        };
+        let nonce: i64 = fixture.nonce.parse().unwrap();
+
+        let unsigned = build_charge_entry_with_nonce(&params, CredentialKind::AddressV2, nonce)
+            .expect("build_charge_entry_with_nonce should succeed for AddressV2 credentials");
+
+        let expected = SorobanAuthorizationEntry::from_xdr_base64(
+            &fixture.unsigned_entry_xdr_base64,
+            Limits::none(),
+        )
+        .expect("fixture XDR should decode");
+
+        let actual_bytes = unsigned
+            .as_xdr()
+            .to_xdr(Limits::none())
+            .expect("constructed entry should encode to XDR");
+        let expected_bytes = expected
+            .to_xdr(Limits::none())
+            .expect("decoded fixture should re-encode to XDR");
+
+        assert_eq!(
+            actual_bytes, expected_bytes,
+            "sorocharge-signer's AddressV2 unsigned entry XDR must be byte-identical to @stellar/stellar-sdk 17.2.0's output"
         );
     }
 }
