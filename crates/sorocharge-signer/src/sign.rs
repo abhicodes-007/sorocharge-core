@@ -1,0 +1,395 @@
+use sha2::{Digest, Sha256};
+use stellar_xdr::{
+    AccountId, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization,
+    HashIdPreimageSorobanAuthorizationWithAddress, Limits, PublicKey, ScAddress, ScBytes, ScMap,
+    ScMapEntry, ScSymbol, ScVal, ScVec, SorobanAddressCredentialsWithDelegates,
+    SorobanAuthorizationEntry, SorobanCredentials, Uint256, VecM, WriteXdr,
+};
+
+use crate::entry::{Address, UnsignedEntry};
+use crate::error::SorochargeError;
+
+/// A source of ed25519 signatures, plus the address it signs for.
+///
+/// Implementations wrap a signing key already in memory (or a remote
+/// signing callback); this library does not manage keys.
+pub trait Signer {
+    /// Signs `preimage` — the 32-byte sha256 digest of the entry's
+    /// `HashIdPreimage` — and returns the raw 64-byte ed25519 signature.
+    fn sign_preimage(&self, preimage: &[u8]) -> Result<[u8; 64], SorochargeError>;
+    /// The Ed25519 account address (`G...`) this signer signs for. Used to
+    /// build the standard `{public_key, signature}` credential signature
+    /// and to find which credential node (top-level address, or a
+    /// delegate) this signature belongs to.
+    fn address(&self) -> Address;
+}
+
+/// A `SorobanAuthorizationEntry` that carries a valid signature on the node
+/// matching its signer's address, ready to serialize to XDR and submit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedEntry(pub(crate) SorobanAuthorizationEntry);
+
+impl SignedEntry {
+    /// The wrapped `SorobanAuthorizationEntry`, ready to attach to an
+    /// `InvokeHostFunction` operation.
+    #[must_use]
+    pub fn as_xdr(&self) -> &SorobanAuthorizationEntry {
+        &self.0
+    }
+}
+
+fn compute_network_id(network_passphrase: &str) -> Hash {
+    Hash(Sha256::digest(network_passphrase.as_bytes()).into())
+}
+
+/// Builds the standard Stellar account signature: a one-element vector
+/// holding a `{public_key, signature}` map, as `__check_auth` for a plain
+/// `G...` account expects. `signer`'s address must be an `Ed25519` account,
+/// not a contract — a contract address has no key to attach here.
+fn build_account_signature_scval(
+    signer: &dyn Signer,
+    signature: [u8; 64],
+) -> Result<ScVal, SorochargeError> {
+    let ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(public_key)))) =
+        signer.address()
+    else {
+        return Err(SorochargeError::SigningFailed {
+            reason: "signer address must be an Ed25519 account (G...), not a contract".to_string(),
+        });
+    };
+
+    let xdr_encoding_failed = |reason: &str| SorochargeError::XdrEncodingFailed {
+        reason: reason.to_string(),
+    };
+
+    let public_key_entry = ScMapEntry {
+        key: ScVal::Symbol(ScSymbol(
+            "public_key"
+                .try_into()
+                .map_err(|_| xdr_encoding_failed("\"public_key\" symbol"))?,
+        )),
+        val: ScVal::Bytes(ScBytes(
+            public_key
+                .to_vec()
+                .try_into()
+                .map_err(|_| xdr_encoding_failed("public key bytes"))?,
+        )),
+    };
+    let signature_entry = ScMapEntry {
+        key: ScVal::Symbol(ScSymbol(
+            "signature"
+                .try_into()
+                .map_err(|_| xdr_encoding_failed("\"signature\" symbol"))?,
+        )),
+        val: ScVal::Bytes(ScBytes(
+            signature
+                .to_vec()
+                .try_into()
+                .map_err(|_| xdr_encoding_failed("signature bytes"))?,
+        )),
+    };
+
+    // Canonical SCMap order: entries sorted by key, and "public_key" < "signature".
+    let map: VecM<ScMapEntry> = vec![public_key_entry, signature_entry]
+        .try_into()
+        .map_err(|_| xdr_encoding_failed("signature map"))?;
+    let vec: VecM<ScVal> = vec![ScVal::Map(Some(ScMap(map)))]
+        .try_into()
+        .map_err(|_| xdr_encoding_failed("signature vector"))?;
+    Ok(ScVal::Vec(Some(ScVec(vec))))
+}
+
+/// Writes `signature_scval` onto whichever node of `credentials` (top-level
+/// address, or one delegate) has address `target`, leaving every other node
+/// untouched.
+///
+/// A `Delegated` entry with more than one required signer needs one
+/// `sign_entry` call per signer; each call targets exactly the node whose
+/// address matches that signer, mirroring the reference SDK's `forAddress`
+/// targeting. Accumulating multiple delegates' signatures across separate
+/// calls is not supported by this function alone (its input/output types
+/// are both single-shot), and is intentionally left for a caller-level
+/// merge step rather than guessed at here.
+fn sign_matching_node(
+    credentials: SorobanCredentials,
+    target: &Address,
+    signature_scval: ScVal,
+) -> Result<SorobanCredentials, SorochargeError> {
+    match credentials {
+        SorobanCredentials::Address(mut c) if &c.address == target => {
+            c.signature = signature_scval;
+            Ok(SorobanCredentials::Address(c))
+        }
+        SorobanCredentials::AddressV2(mut c) if &c.address == target => {
+            c.signature = signature_scval;
+            Ok(SorobanCredentials::AddressV2(c))
+        }
+        SorobanCredentials::AddressWithDelegates(c) => {
+            sign_with_delegates(c, target, signature_scval)
+                .map(SorobanCredentials::AddressWithDelegates)
+        }
+        SorobanCredentials::Address(_)
+        | SorobanCredentials::AddressV2(_)
+        | SorobanCredentials::SourceAccount => Err(SorochargeError::NoMatchingCredentialNode),
+    }
+}
+
+fn sign_with_delegates(
+    mut credentials: SorobanAddressCredentialsWithDelegates,
+    target: &Address,
+    signature_scval: ScVal,
+) -> Result<SorobanAddressCredentialsWithDelegates, SorochargeError> {
+    if &credentials.address_credentials.address == target {
+        credentials.address_credentials.signature = signature_scval;
+        return Ok(credentials);
+    }
+
+    let mut matched = false;
+    let signed_delegates: Vec<_> = credentials
+        .delegates
+        .into_iter()
+        .map(|mut delegate| {
+            if !matched && &delegate.address == target {
+                delegate.signature = signature_scval.clone();
+                matched = true;
+            }
+            delegate
+        })
+        .collect();
+
+    if !matched {
+        return Err(SorochargeError::NoMatchingCredentialNode);
+    }
+
+    credentials.delegates =
+        signed_delegates
+            .try_into()
+            .map_err(|_| SorochargeError::XdrEncodingFailed {
+                reason: "delegate list exceeds XDR limit".to_string(),
+            })?;
+    Ok(credentials)
+}
+
+/// Signs an unsigned charge entry, producing a [`SignedEntry`] ready to
+/// submit.
+///
+/// The signature is written to whichever credential node — the top-level
+/// address, or (for `Delegated`) one delegate — has an address matching
+/// `signer.address()`. The signing payload is the sha256 of the entry's
+/// `HashIdPreimage`, reconstructed for the entry's actual credential type:
+/// the legacy, non-address-bound preimage for `Legacy`, and the CAP-71
+/// address-bound preimage for `AddressV2` and `Delegated`.
+///
+/// `network_passphrase` is hashed into the preimage's `network_id`: the
+/// signing payload is network-bound, so signing for the wrong network
+/// produces a signature the intended network's host will reject (and,
+/// worse, one that could be replayed if the wrong passphrase were reused
+/// across networks) — this is why it is a required argument here rather
+/// than assumed.
+///
+/// # Errors
+///
+/// Returns [`SorochargeError::NoMatchingCredentialNode`] if `signer`'s
+/// address matches no signable node in `entry`, and
+/// [`SorochargeError::SigningFailed`] if `signer` itself fails, or is not
+/// an Ed25519 account address.
+pub fn sign_entry(
+    entry: UnsignedEntry,
+    signer: &dyn Signer,
+    network_passphrase: &str,
+) -> Result<SignedEntry, SorochargeError> {
+    let SorobanAuthorizationEntry {
+        credentials,
+        root_invocation,
+    } = entry.0;
+
+    let (nonce, signature_expiration_ledger, address_bound_to) = match &credentials {
+        SorobanCredentials::Address(c) => (c.nonce, c.signature_expiration_ledger, None),
+        SorobanCredentials::AddressV2(c) => (
+            c.nonce,
+            c.signature_expiration_ledger,
+            Some(c.address.clone()),
+        ),
+        SorobanCredentials::AddressWithDelegates(c) => (
+            c.address_credentials.nonce,
+            c.address_credentials.signature_expiration_ledger,
+            Some(c.address_credentials.address.clone()),
+        ),
+        SorobanCredentials::SourceAccount => {
+            return Err(SorochargeError::UnsupportedCredentialType)
+        }
+    };
+
+    let network_id = compute_network_id(network_passphrase);
+    let preimage = match address_bound_to {
+        None => HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
+            network_id,
+            nonce,
+            signature_expiration_ledger,
+            invocation: root_invocation.clone(),
+        }),
+        Some(address) => HashIdPreimage::SorobanAuthorizationWithAddress(
+            HashIdPreimageSorobanAuthorizationWithAddress {
+                network_id,
+                nonce,
+                signature_expiration_ledger,
+                address,
+                invocation: root_invocation.clone(),
+            },
+        ),
+    };
+
+    let preimage_bytes =
+        preimage
+            .to_xdr(Limits::none())
+            .map_err(|e| SorochargeError::XdrEncodingFailed {
+                reason: format!("failed to encode HashIdPreimage: {e}"),
+            })?;
+    let payload: [u8; 32] = Sha256::digest(&preimage_bytes).into();
+
+    let raw_signature = signer.sign_preimage(&payload)?;
+    let signature_scval = build_account_signature_scval(signer, raw_signature)?;
+
+    let target = signer.address();
+    let signed_credentials = sign_matching_node(credentials, &target, signature_scval)?;
+
+    Ok(SignedEntry(SorobanAuthorizationEntry {
+        credentials: signed_credentials,
+        root_invocation,
+    }))
+}
+
+#[cfg(test)]
+mod golden_vector_tests {
+    use super::*;
+    use crate::entry::{build_charge_entry_with_nonce, ChargeParams, CredentialKind};
+    use ed25519_dalek::{Signer as DalekSigner, SigningKey};
+    use serde::Deserialize;
+    use stellar_xdr::ReadXdr;
+
+    /// Diffs `sign_entry`'s XDR output — including the signature it
+    /// produces — against a fixture signed by the pinned
+    /// `@stellar/stellar-sdk`'s own `authorizeEntry`.
+    #[derive(Deserialize)]
+    struct SignedFixture {
+        asset_contract: String,
+        payer: String,
+        recipient: String,
+        amount: String,
+        valid_until_ledger: u32,
+        nonce: String,
+        network_passphrase: String,
+        signed_entry_xdr_base64: String,
+    }
+
+    fn load_signed_fixture(name: &str) -> SignedFixture {
+        let path = format!(
+            "{}/../../tests/golden_vectors/fixtures/{name}.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read fixture {path}: {e}"));
+        serde_json::from_str(&contents)
+            .unwrap_or_else(|e| panic!("failed to parse fixture {path}: {e}"))
+    }
+
+    /// A fixed-seed ed25519 signer matching the `payerKeypair` that
+    /// `generate.mjs` derives via `Keypair.fromRawEd25519Seed`, so both
+    /// sides sign with the identical key.
+    struct FixedSeedSigner {
+        signing_key: SigningKey,
+        address: Address,
+    }
+
+    impl Signer for FixedSeedSigner {
+        fn sign_preimage(&self, preimage: &[u8]) -> Result<[u8; 64], SorochargeError> {
+            Ok(self.signing_key.sign(preimage).to_bytes())
+        }
+
+        fn address(&self) -> Address {
+            self.address.clone()
+        }
+    }
+
+    #[test]
+    fn legacy_sign_entry_matches_reference_sdk_byte_for_byte() {
+        let fixture = load_signed_fixture("legacy_transfer_signed");
+
+        let params = ChargeParams {
+            asset_contract: fixture.asset_contract.parse::<ScAddress>().unwrap(),
+            amount: fixture.amount.parse().unwrap(),
+            payer: fixture.payer.parse::<ScAddress>().unwrap(),
+            recipient: fixture.recipient.parse::<ScAddress>().unwrap(),
+            valid_until_ledger: fixture.valid_until_ledger,
+        };
+        let nonce: i64 = fixture.nonce.parse().unwrap();
+
+        let unsigned = build_charge_entry_with_nonce(&params, CredentialKind::Legacy, nonce)
+            .expect("build_charge_entry_with_nonce should succeed for legacy credentials");
+
+        // The same 32-byte seed generate.mjs passes to Keypair.fromRawEd25519Seed
+        // for the payer, so both sides sign with the identical key.
+        let signing_key = SigningKey::from_bytes(&[0x11u8; 32]);
+        let signer = FixedSeedSigner {
+            signing_key,
+            address: params.payer.clone(),
+        };
+
+        let signed = sign_entry(unsigned, &signer, &fixture.network_passphrase)
+            .expect("sign_entry should succeed against a matching signer address");
+
+        let expected = SorobanAuthorizationEntry::from_xdr_base64(
+            &fixture.signed_entry_xdr_base64,
+            Limits::none(),
+        )
+        .expect("fixture XDR should decode");
+
+        let actual_bytes = signed
+            .as_xdr()
+            .to_xdr(Limits::none())
+            .expect("signed entry should encode to XDR");
+        let expected_bytes = expected
+            .to_xdr(Limits::none())
+            .expect("decoded fixture should re-encode to XDR");
+
+        assert_eq!(
+            actual_bytes, expected_bytes,
+            "sorocharge-signer's signed entry XDR (including the ed25519 signature) must be byte-identical to @stellar/stellar-sdk 17.2.0's authorizeEntry output"
+        );
+    }
+
+    #[test]
+    fn sign_entry_rejects_signer_for_a_different_address() {
+        let params = ChargeParams {
+            asset_contract: "CAZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGGJH"
+                .parse()
+                .unwrap(),
+            amount: 1,
+            payer: "GDIEVMRSOQV3JKZ2CNUL2RQV4TTNAISKW4NAC25PQUQKGMWJO6DTOAE7"
+                .parse()
+                .unwrap(),
+            recipient: "GCQJVJPUPJTVTABP7FK7RXBNFIKKLSM5EO7JP6DECJ77SOBUKWSPB64N"
+                .parse()
+                .unwrap(),
+            valid_until_ledger: 1,
+        };
+        let unsigned = build_charge_entry_with_nonce(&params, CredentialKind::Legacy, 1).unwrap();
+
+        // A signer for an address other than the payer's.
+        let signing_key = SigningKey::from_bytes(&[0x99u8; 32]);
+        let wrong_address: Address = "GCQJVJPUPJTVTABP7FK7RXBNFIKKLSM5EO7JP6DECJ77SOBUKWSPB64N"
+            .parse()
+            .unwrap();
+        let signer = FixedSeedSigner {
+            signing_key,
+            address: wrong_address,
+        };
+
+        let result = sign_entry(unsigned, &signer, "Test SDF Network ; September 2015");
+
+        assert_eq!(
+            result.unwrap_err(),
+            SorochargeError::NoMatchingCredentialNode
+        );
+    }
+}

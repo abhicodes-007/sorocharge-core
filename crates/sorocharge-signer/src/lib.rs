@@ -2,6 +2,8 @@
 
 mod entry;
 mod error;
+mod sign;
 
 pub use entry::{build_charge_entry, Address, ChargeParams, CredentialKind, UnsignedEntry};
 pub use error::SorochargeError;
+pub use sign::{sign_entry, SignedEntry, Signer};

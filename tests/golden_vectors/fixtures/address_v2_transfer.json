@@ -1,5 +1,5 @@
 {
-  "description": "address_v2_transfer: unsigned SorobanAuthorizationEntry for a SEP-41 transfer",
+  "description": "address_v2_transfer: a SorobanAuthorizationEntry for a SEP-41 transfer",
   "sdk_version": "17.2.0",
   "asset_contract": "CAZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGGJH",
   "payer": "GDIEVMRSOQV3JKZ2CNUL2RQV4TTNAISKW4NAC25PQUQKGMWJO6DTOAE7",

@@ -31,6 +31,9 @@ pub enum SorochargeError {
     RecipientMismatch,
     /// The signature does not verify against the reconstructed preimage.
     InvalidSignature,
+    /// A signer's address matches no credential node (top-level address or
+    /// delegate) in the entry being signed.
+    NoMatchingCredentialNode,
     /// The `Signer` implementation returned an error while signing a preimage.
     SigningFailed { reason: String },
     /// Constructing or serializing an XDR structure failed.
@@ -63,6 +66,10 @@ impl fmt::Display for SorochargeError {
             Self::AmountMismatch => write!(f, "amount does not match expected charge"),
             Self::RecipientMismatch => write!(f, "recipient does not match expected charge"),
             Self::InvalidSignature => write!(f, "signature is invalid for the entry's credential"),
+            Self::NoMatchingCredentialNode => write!(
+                f,
+                "signer's address matches no credential node in this entry"
+            ),
             Self::SigningFailed { reason } => write!(f, "signing failed: {reason}"),
             Self::XdrEncodingFailed { reason } => write!(f, "XDR encoding failed: {reason}"),
         }

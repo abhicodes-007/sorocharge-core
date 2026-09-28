@@ -12,6 +12,7 @@ stellar-xdr = { workspace = true }
 stellar-strkey = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
+sha2 = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]

@@ -15,9 +15,11 @@ import { fileURLToPath } from "node:url";
 import {
   Address,
   Keypair,
+  Networks,
   StrKey,
   xdr,
   nativeToScVal,
+  authorizeEntry,
   buildWithDelegatesEntry,
 } from "@stellar/stellar-sdk";
 
@@ -121,9 +123,9 @@ function buildDelegatedEntry() {
   return { entry, delegateA: delegateAKeypair.publicKey(), delegateB: delegateBKeypair.publicKey() };
 }
 
-function writeFixture(name, entry, extra = {}) {
+function writeFixture(name, entry, extra = {}, xdrField = "unsigned_entry_xdr_base64") {
   const fixture = {
-    description: `${name}: unsigned SorobanAuthorizationEntry for a SEP-41 transfer`,
+    description: `${name}: a SorobanAuthorizationEntry for a SEP-41 transfer`,
     sdk_version: "17.2.0",
     asset_contract: assetContract,
     payer,
@@ -132,7 +134,7 @@ function writeFixture(name, entry, extra = {}) {
     valid_until_ledger: validUntilLedger,
     nonce: nonce.toString(),
     ...extra,
-    unsigned_entry_xdr_base64: entry.toXdr("base64"),
+    [xdrField]: entry.toXdr("base64"),
   };
   const path = join(fixturesDir, `${name}.json`);
   writeFileSync(path, `${JSON.stringify(fixture, null, 2)}\n`);
@@ -148,3 +150,17 @@ writeFixture("delegated_transfer", delegated.entry, {
   // sorted order buildWithDelegatesEntry actually produced.
   delegate_signers: [delegated.delegateB, delegated.delegateA],
 });
+
+const networkPassphrase = Networks.TESTNET;
+const signedLegacyEntry = await authorizeEntry(
+  buildLegacyEntry(),
+  payerKeypair,
+  validUntilLedger,
+  networkPassphrase,
+);
+writeFixture(
+  "legacy_transfer_signed",
+  signedLegacyEntry,
+  { network_passphrase: networkPassphrase },
+  "signed_entry_xdr_base64",
+);
