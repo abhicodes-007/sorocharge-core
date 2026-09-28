@@ -1,7 +1,8 @@
 use stellar_xdr::{
-    Int128Parts, InvokeContractArgs, ScAddress, ScSymbol, ScVal, ScVec, SorobanAddressCredentials,
-    SorobanAuthorizationEntry, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
-    SorobanCredentials, VecM,
+    Int128Parts, InvokeContractArgs, Limits, ScAddress, ScSymbol, ScVal, ScVec,
+    SorobanAddressCredentials, SorobanAddressCredentialsWithDelegates, SorobanAuthorizationEntry,
+    SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials,
+    SorobanDelegateSignature, VecM, WriteXdr,
 };
 
 use crate::error::SorochargeError;
@@ -95,6 +96,72 @@ fn build_address_credentials(params: &ChargeParams, nonce: i64) -> SorobanAddres
     }
 }
 
+/// Builds `SorobanAddressCredentialsWithDelegates` for a `Delegated`
+/// credential: `signers` become the (possibly multiple) delegate nodes,
+/// sorted by their XDR-encoded address bytes ascending and checked for
+/// duplicates, exactly as CAP-71-01 requires and as the reference SDK's
+/// `buildWithDelegatesEntry` does — a network host rejects an entry whose
+/// delegates aren't sorted, and a duplicate delegate can never be
+/// meaningfully satisfied. The top-level and per-delegate signatures are
+/// `ScVal::Void` placeholders, matching `buildWithDelegatesEntry`'s own
+/// unsigned default (the plain `Address`/`AddressV2` credentials use an
+/// empty-vector placeholder instead; the two builders simply chose
+/// different placeholder values, and this library matches each one).
+fn build_delegated_credentials(
+    params: &ChargeParams,
+    nonce: i64,
+    signers: &[Address],
+) -> Result<SorobanAddressCredentialsWithDelegates, SorochargeError> {
+    if signers.is_empty() {
+        return Err(SorochargeError::EmptyDelegateSigners);
+    }
+
+    let mut keyed: Vec<(Vec<u8>, Address)> = signers
+        .iter()
+        .map(|address| {
+            address
+                .to_xdr(Limits::none())
+                .map(|bytes| (bytes, address.clone()))
+                .map_err(|e| SorochargeError::XdrEncodingFailed {
+                    reason: format!("failed to encode delegate address: {e}"),
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    for pair in keyed.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            return Err(SorochargeError::DuplicateDelegateSigner);
+        }
+    }
+
+    let delegate_nodes: Vec<SorobanDelegateSignature> = keyed
+        .into_iter()
+        .map(|(_, address)| SorobanDelegateSignature {
+            address,
+            signature: ScVal::Void,
+            nested_delegates: VecM::default(),
+        })
+        .collect();
+    let delegates: VecM<SorobanDelegateSignature> =
+        delegate_nodes
+            .try_into()
+            .map_err(|_| SorochargeError::XdrEncodingFailed {
+                reason: "too many delegate signers for a single credential".to_string(),
+            })?;
+
+    let address_credentials = SorobanAddressCredentials {
+        address: params.payer.clone(),
+        nonce,
+        signature_expiration_ledger: params.valid_until_ledger,
+        signature: ScVal::Void,
+    };
+
+    Ok(SorobanAddressCredentialsWithDelegates {
+        address_credentials,
+        delegates,
+    })
+}
+
 /// Builds the `InvokeContractArgs` for a SEP-41 `transfer(from, to, amount)`
 /// call, the single invocation every charge entry this library produces
 /// authorizes.
@@ -184,9 +251,9 @@ pub(crate) fn build_charge_entry_with_nonce(
         CredentialKind::AddressV2 => {
             SorobanCredentials::AddressV2(build_address_credentials(params, nonce))
         }
-        CredentialKind::Delegated { .. } => {
-            return Err(SorochargeError::UnsupportedCredentialType);
-        }
+        CredentialKind::Delegated { signers } => SorobanCredentials::AddressWithDelegates(
+            build_delegated_credentials(params, nonce, &signers)?,
+        ),
     };
 
     Ok(UnsignedEntry(SorobanAuthorizationEntry {
@@ -214,6 +281,8 @@ mod golden_vector_tests {
         amount: String,
         valid_until_ledger: u32,
         nonce: String,
+        #[serde(default)]
+        delegate_signers: Vec<String>,
         unsigned_entry_xdr_base64: String,
     }
 
@@ -298,5 +367,104 @@ mod golden_vector_tests {
             actual_bytes, expected_bytes,
             "sorocharge-signer's AddressV2 unsigned entry XDR must be byte-identical to @stellar/stellar-sdk 17.2.0's output"
         );
+    }
+
+    #[test]
+    fn delegated_transfer_matches_reference_sdk_byte_for_byte() {
+        let fixture = load_fixture("delegated_transfer");
+
+        let params = ChargeParams {
+            asset_contract: fixture.asset_contract.parse::<ScAddress>().unwrap(),
+            amount: fixture.amount.parse().unwrap(),
+            payer: fixture.payer.parse::<ScAddress>().unwrap(),
+            recipient: fixture.recipient.parse::<ScAddress>().unwrap(),
+            valid_until_ledger: fixture.valid_until_ledger,
+        };
+        let nonce: i64 = fixture.nonce.parse().unwrap();
+        let signers: Vec<ScAddress> = fixture
+            .delegate_signers
+            .iter()
+            .map(|s| s.parse::<ScAddress>().unwrap())
+            .collect();
+        assert!(
+            signers.len() >= 2,
+            "fixture should exercise more than one delegate signer"
+        );
+
+        let unsigned =
+            build_charge_entry_with_nonce(&params, CredentialKind::Delegated { signers }, nonce)
+                .expect("build_charge_entry_with_nonce should succeed for Delegated credentials");
+
+        let expected = SorobanAuthorizationEntry::from_xdr_base64(
+            &fixture.unsigned_entry_xdr_base64,
+            Limits::none(),
+        )
+        .expect("fixture XDR should decode");
+
+        let actual_bytes = unsigned
+            .as_xdr()
+            .to_xdr(Limits::none())
+            .expect("constructed entry should encode to XDR");
+        let expected_bytes = expected
+            .to_xdr(Limits::none())
+            .expect("decoded fixture should re-encode to XDR");
+
+        assert_eq!(
+            actual_bytes, expected_bytes,
+            "sorocharge-signer's Delegated unsigned entry XDR (including delegate sort order) must be byte-identical to @stellar/stellar-sdk 17.2.0's output"
+        );
+    }
+
+    #[test]
+    fn delegated_credential_rejects_empty_signers() {
+        let params = ChargeParams {
+            asset_contract: "CAZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGGJH"
+                .parse()
+                .unwrap(),
+            amount: 1,
+            payer: "GDIEVMRSOQV3JKZ2CNUL2RQV4TTNAISKW4NAC25PQUQKGMWJO6DTOAE7"
+                .parse()
+                .unwrap(),
+            recipient: "GCQJVJPUPJTVTABP7FK7RXBNFIKKLSM5EO7JP6DECJ77SOBUKWSPB64N"
+                .parse()
+                .unwrap(),
+            valid_until_ledger: 1,
+        };
+
+        let result = build_charge_entry_with_nonce(
+            &params,
+            CredentialKind::Delegated { signers: vec![] },
+            1,
+        );
+
+        assert_eq!(result, Err(SorochargeError::EmptyDelegateSigners));
+    }
+
+    #[test]
+    fn delegated_credential_rejects_duplicate_signers() {
+        let payer: ScAddress = "GDIEVMRSOQV3JKZ2CNUL2RQV4TTNAISKW4NAC25PQUQKGMWJO6DTOAE7"
+            .parse()
+            .unwrap();
+        let params = ChargeParams {
+            asset_contract: "CAZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGGJH"
+                .parse()
+                .unwrap(),
+            amount: 1,
+            payer: payer.clone(),
+            recipient: "GCQJVJPUPJTVTABP7FK7RXBNFIKKLSM5EO7JP6DECJ77SOBUKWSPB64N"
+                .parse()
+                .unwrap(),
+            valid_until_ledger: 1,
+        };
+
+        let result = build_charge_entry_with_nonce(
+            &params,
+            CredentialKind::Delegated {
+                signers: vec![payer.clone(), payer],
+            },
+            1,
+        );
+
+        assert_eq!(result, Err(SorochargeError::DuplicateDelegateSigner));
     }
 }

@@ -12,7 +12,14 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Address, Keypair, StrKey, xdr, nativeToScVal } from "@stellar/stellar-sdk";
+import {
+  Address,
+  Keypair,
+  StrKey,
+  xdr,
+  nativeToScVal,
+  buildWithDelegatesEntry,
+} from "@stellar/stellar-sdk";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = join(here, "fixtures");
@@ -82,7 +89,39 @@ function buildAddressV2Entry() {
   });
 }
 
-function writeFixture(name, entry) {
+function buildDelegatedEntry() {
+  const delegateAKeypair = Keypair.fromRawEd25519Seed(fixedSeed(0x44));
+  const delegateBKeypair = Keypair.fromRawEd25519Seed(fixedSeed(0x55));
+
+  const addressCredentials = new xdr.SorobanAddressCredentials({
+    address: new Address(payer).toScAddress(),
+    nonce,
+    signatureExpirationLedger: validUntilLedger,
+    signature: xdr.ScVal.scvVoid(),
+  });
+
+  // Passed out of address order on purpose to exercise
+  // buildWithDelegatesEntry's own ascending sort by address.
+  const delegates = [
+    { address: delegateBKeypair.publicKey() },
+    { address: delegateAKeypair.publicKey() },
+  ];
+
+  const entryWithoutDelegates = new xdr.SorobanAuthorizationEntry({
+    credentials: xdr.SorobanCredentials.sorobanCredentialsAddress(addressCredentials),
+    rootInvocation: buildTransferInvocation(),
+  });
+
+  const entry = buildWithDelegatesEntry({
+    entry: entryWithoutDelegates,
+    validUntilLedgerSeq: validUntilLedger,
+    delegates,
+  });
+
+  return { entry, delegateA: delegateAKeypair.publicKey(), delegateB: delegateBKeypair.publicKey() };
+}
+
+function writeFixture(name, entry, extra = {}) {
   const fixture = {
     description: `${name}: unsigned SorobanAuthorizationEntry for a SEP-41 transfer`,
     sdk_version: "17.2.0",
@@ -92,6 +131,7 @@ function writeFixture(name, entry) {
     amount: amount.toString(),
     valid_until_ledger: validUntilLedger,
     nonce: nonce.toString(),
+    ...extra,
     unsigned_entry_xdr_base64: entry.toXdr("base64"),
   };
   const path = join(fixturesDir, `${name}.json`);
@@ -101,3 +141,10 @@ function writeFixture(name, entry) {
 
 writeFixture("legacy_transfer", buildLegacyEntry());
 writeFixture("address_v2_transfer", buildAddressV2Entry());
+
+const delegated = buildDelegatedEntry();
+writeFixture("delegated_transfer", delegated.entry, {
+  // Listed out of sort order on purpose; the fixture's XDR reflects the
+  // sorted order buildWithDelegatesEntry actually produced.
+  delegate_signers: [delegated.delegateB, delegated.delegateA],
+});

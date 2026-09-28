@@ -15,6 +15,9 @@ pub enum SorochargeError {
     /// `Delegated` was constructed with no signers, which can never satisfy
     /// `__check_auth`.
     EmptyDelegateSigners,
+    /// `Delegated` named the same address as a delegate signer more than
+    /// once, which CAP-71-01 forbids (the host rejects the entry).
+    DuplicateDelegateSigner,
     /// The entry's `valid_until_ledger` has already passed `current_ledger`.
     ExpiredEntry {
         valid_until_ledger: u32,
@@ -45,6 +48,9 @@ impl fmt::Display for SorochargeError {
             }
             Self::EmptyDelegateSigners => {
                 write!(f, "delegated credential requires at least one signer")
+            }
+            Self::DuplicateDelegateSigner => {
+                write!(f, "delegated credential lists the same signer address more than once")
             }
             Self::ExpiredEntry {
                 valid_until_ledger,
