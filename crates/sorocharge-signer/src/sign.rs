@@ -38,6 +38,19 @@ impl SignedEntry {
     pub fn as_xdr(&self) -> &SorobanAuthorizationEntry {
         &self.0
     }
+
+    /// Wraps an entry that already carries a signature — typically one a
+    /// facilitator or payee received over the wire from a payer, rather
+    /// than one this process signed itself — so it can be checked with
+    /// [`crate::verify_entry`].
+    ///
+    /// This performs no validation: it does not check the entry actually
+    /// carries a non-placeholder signature, let alone a valid one.
+    /// `verify_entry` is what proves that.
+    #[must_use]
+    pub fn from_xdr(entry: SorobanAuthorizationEntry) -> Self {
+        Self(entry)
+    }
 }
 
 fn compute_network_id(network_passphrase: &str) -> Hash {
