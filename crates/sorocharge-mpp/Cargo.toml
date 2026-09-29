@@ -9,6 +9,16 @@ description = "MPP draft-stellar-charge-00 wire-format adapter for sorocharge-si
 
 [dependencies]
 sorocharge-signer = { path = "../sorocharge-signer" }
+stellar-xdr = { workspace = true }
 stellar-rpc-client = { workspace = true }
+reqwest = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+serde_jcs = { workspace = true }
+chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+ed25519-dalek = { workspace = true }
