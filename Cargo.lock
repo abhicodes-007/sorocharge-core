@@ -1994,6 +1994,7 @@ dependencies = [
  "sha2 0.11.0",
  "sorocharge-signer",
  "stellar-rpc-client",
+ "stellar-strkey 0.0.18",
  "stellar-xdr",
  "tokio",
 ]
@@ -2023,6 +2024,7 @@ dependencies = [
  "sha2 0.11.0",
  "sorocharge-signer",
  "stellar-rpc-client",
+ "stellar-strkey 0.0.18",
  "stellar-xdr",
  "tokio",
 ]
