@@ -6,6 +6,8 @@ use stellar_xdr::{
     SorobanAuthorizationEntry, SorobanCredentials, Uint256, VecM, WriteXdr,
 };
 
+use stellar_xdr::SorobanAuthorizedInvocation;
+
 use crate::entry::{Address, UnsignedEntry};
 use crate::error::SorochargeError;
 
@@ -42,22 +44,78 @@ fn compute_network_id(network_passphrase: &str) -> Hash {
     Hash(Sha256::digest(network_passphrase.as_bytes()).into())
 }
 
+/// The `(nonce, signature_expiration_ledger, address-bound-to)` fields a
+/// `HashIdPreimage` needs, read from whichever `SorobanCredentials` variant
+/// `credentials` is. `address_bound_to` is `None` for `Legacy` (whose
+/// preimage does not bind an address) and `Some` for `AddressV2` and
+/// `AddressWithDelegates` (CAP-71's address-bound preimage).
+pub(crate) fn credential_preimage_fields(
+    credentials: &SorobanCredentials,
+) -> Result<(i64, u32, Option<Address>), SorochargeError> {
+    match credentials {
+        SorobanCredentials::Address(c) => Ok((c.nonce, c.signature_expiration_ledger, None)),
+        SorobanCredentials::AddressV2(c) => Ok((
+            c.nonce,
+            c.signature_expiration_ledger,
+            Some(c.address.clone()),
+        )),
+        SorobanCredentials::AddressWithDelegates(c) => Ok((
+            c.address_credentials.nonce,
+            c.address_credentials.signature_expiration_ledger,
+            Some(c.address_credentials.address.clone()),
+        )),
+        SorobanCredentials::SourceAccount => Err(SorochargeError::UnsupportedCredentialType),
+    }
+}
+
+/// The sha256 digest of the entry's `HashIdPreimage` — the payload every
+/// credential's signature (top-level or delegate) is computed over. Shared
+/// by `sign_entry` (which signs it) and `verify_entry` (which checks
+/// signatures against it), so the two can never reconstruct it differently.
+pub(crate) fn signing_payload(
+    credentials: &SorobanCredentials,
+    root_invocation: &SorobanAuthorizedInvocation,
+    network_passphrase: &str,
+) -> Result<[u8; 32], SorochargeError> {
+    let (nonce, signature_expiration_ledger, address_bound_to) =
+        credential_preimage_fields(credentials)?;
+    let network_id = compute_network_id(network_passphrase);
+
+    let preimage = match address_bound_to {
+        None => HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
+            network_id,
+            nonce,
+            signature_expiration_ledger,
+            invocation: root_invocation.clone(),
+        }),
+        Some(address) => HashIdPreimage::SorobanAuthorizationWithAddress(
+            HashIdPreimageSorobanAuthorizationWithAddress {
+                network_id,
+                nonce,
+                signature_expiration_ledger,
+                address,
+                invocation: root_invocation.clone(),
+            },
+        ),
+    };
+
+    let preimage_bytes =
+        preimage
+            .to_xdr(Limits::none())
+            .map_err(|e| SorochargeError::XdrEncodingFailed {
+                reason: format!("failed to encode HashIdPreimage: {e}"),
+            })?;
+    Ok(Sha256::digest(&preimage_bytes).into())
+}
+
 /// Builds the standard Stellar account signature: a one-element vector
 /// holding a `{public_key, signature}` map, as `__check_auth` for a plain
 /// `G...` account expects. `signer`'s address must be an `Ed25519` account,
 /// not a contract — a contract address has no key to attach here.
-fn build_account_signature_scval(
-    signer: &dyn Signer,
+pub(crate) fn build_account_signature_scval(
+    public_key: [u8; 32],
     signature: [u8; 64],
 ) -> Result<ScVal, SorochargeError> {
-    let ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(public_key)))) =
-        signer.address()
-    else {
-        return Err(SorochargeError::SigningFailed {
-            reason: "signer address must be an Ed25519 account (G...), not a contract".to_string(),
-        });
-    };
-
     let xdr_encoding_failed = |reason: &str| SorochargeError::XdrEncodingFailed {
         reason: reason.to_string(),
     };
@@ -203,54 +261,19 @@ pub fn sign_entry(
         root_invocation,
     } = entry.0;
 
-    let (nonce, signature_expiration_ledger, address_bound_to) = match &credentials {
-        SorobanCredentials::Address(c) => (c.nonce, c.signature_expiration_ledger, None),
-        SorobanCredentials::AddressV2(c) => (
-            c.nonce,
-            c.signature_expiration_ledger,
-            Some(c.address.clone()),
-        ),
-        SorobanCredentials::AddressWithDelegates(c) => (
-            c.address_credentials.nonce,
-            c.address_credentials.signature_expiration_ledger,
-            Some(c.address_credentials.address.clone()),
-        ),
-        SorobanCredentials::SourceAccount => {
-            return Err(SorochargeError::UnsupportedCredentialType)
-        }
-    };
-
-    let network_id = compute_network_id(network_passphrase);
-    let preimage = match address_bound_to {
-        None => HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
-            network_id,
-            nonce,
-            signature_expiration_ledger,
-            invocation: root_invocation.clone(),
-        }),
-        Some(address) => HashIdPreimage::SorobanAuthorizationWithAddress(
-            HashIdPreimageSorobanAuthorizationWithAddress {
-                network_id,
-                nonce,
-                signature_expiration_ledger,
-                address,
-                invocation: root_invocation.clone(),
-            },
-        ),
-    };
-
-    let preimage_bytes =
-        preimage
-            .to_xdr(Limits::none())
-            .map_err(|e| SorochargeError::XdrEncodingFailed {
-                reason: format!("failed to encode HashIdPreimage: {e}"),
-            })?;
-    let payload: [u8; 32] = Sha256::digest(&preimage_bytes).into();
-
-    let raw_signature = signer.sign_preimage(&payload)?;
-    let signature_scval = build_account_signature_scval(signer, raw_signature)?;
-
     let target = signer.address();
+    let ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(public_key)))) =
+        target.clone()
+    else {
+        return Err(SorochargeError::SigningFailed {
+            reason: "signer address must be an Ed25519 account (G...), not a contract".to_string(),
+        });
+    };
+
+    let payload = signing_payload(&credentials, &root_invocation, network_passphrase)?;
+    let raw_signature = signer.sign_preimage(&payload)?;
+    let signature_scval = build_account_signature_scval(public_key, raw_signature)?;
+
     let signed_credentials = sign_matching_node(credentials, &target, signature_scval)?;
 
     Ok(SignedEntry(SorobanAuthorizationEntry {

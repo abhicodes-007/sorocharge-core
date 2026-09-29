@@ -23,8 +23,14 @@ pub enum SorochargeError {
         valid_until_ledger: u32,
         current_ledger: u32,
     },
+    /// The entry's invocation is not a SEP-41 `transfer(from, to, amount)`
+    /// call on a single contract, so there is nothing meaningful to compare
+    /// its asset/payer/amount/recipient against.
+    UnexpectedInvocationShape,
     /// The entry's asset contract does not match `ChargeParams::asset_contract`.
     AssetMismatch,
+    /// The entry's authorizing address does not match `ChargeParams::payer`.
+    PayerMismatch,
     /// The entry's amount does not match `ChargeParams::amount` exactly.
     AmountMismatch,
     /// The entry's recipient does not match `ChargeParams::recipient`.
@@ -62,7 +68,12 @@ impl fmt::Display for SorochargeError {
                 f,
                 "entry expired: valid until ledger {valid_until_ledger}, current ledger {current_ledger}"
             ),
+            Self::UnexpectedInvocationShape => write!(
+                f,
+                "entry does not authorize a single SEP-41 transfer(from, to, amount) call"
+            ),
             Self::AssetMismatch => write!(f, "asset contract does not match expected charge"),
+            Self::PayerMismatch => write!(f, "authorizing address does not match expected payer"),
             Self::AmountMismatch => write!(f, "amount does not match expected charge"),
             Self::RecipientMismatch => write!(f, "recipient does not match expected charge"),
             Self::InvalidSignature => write!(f, "signature is invalid for the entry's credential"),

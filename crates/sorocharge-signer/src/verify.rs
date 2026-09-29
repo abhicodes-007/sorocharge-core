@@ -1,0 +1,410 @@
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use stellar_xdr::{
+    ScAddress, ScSymbol, ScVal, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+    SorobanCredentials,
+};
+
+use crate::entry::{Address, ChargeParams};
+use crate::error::SorochargeError;
+use crate::sign::{signing_payload, SignedEntry};
+
+struct TransferArgs {
+    asset_contract: Address,
+    from: Address,
+    to: Address,
+    amount: i128,
+}
+
+/// Pulls the `(contract, from, to, amount)` a SEP-41 `transfer` invocation
+/// authorizes out of `invocation`, rejecting anything else: sub-invocations
+/// (which could authorize side effects beyond the stated transfer), a
+/// different function, or a different argument shape.
+fn extract_transfer_args(
+    invocation: &SorobanAuthorizedInvocation,
+) -> Result<TransferArgs, SorochargeError> {
+    if !invocation.sub_invocations.is_empty() {
+        return Err(SorochargeError::UnexpectedInvocationShape);
+    }
+    let SorobanAuthorizedFunction::ContractFn(invoke) = &invocation.function else {
+        return Err(SorochargeError::UnexpectedInvocationShape);
+    };
+    let expected_name: ScSymbol = "transfer"
+        .try_into()
+        .map(ScSymbol)
+        .map_err(|_| SorochargeError::UnexpectedInvocationShape)?;
+    if invoke.function_name != expected_name {
+        return Err(SorochargeError::UnexpectedInvocationShape);
+    }
+    let [ScVal::Address(from), ScVal::Address(to), ScVal::I128(amount_parts)] =
+        invoke.args.as_slice()
+    else {
+        return Err(SorochargeError::UnexpectedInvocationShape);
+    };
+    let amount = (i128::from(amount_parts.hi) << 64) | i128::from(amount_parts.lo);
+
+    Ok(TransferArgs {
+        asset_contract: invoke.contract_address.clone(),
+        from: from.clone(),
+        to: to.clone(),
+        amount,
+    })
+}
+
+/// The address a `SorobanAuthorizationEntry`'s credential authorizes for,
+/// alongside every node whose signature could satisfy it: just itself for
+/// `Address`/`AddressV2`, or itself plus each delegate for
+/// `AddressWithDelegates`.
+fn authorizing_address_and_signable_nodes(
+    credentials: &SorobanCredentials,
+) -> Result<(Address, Vec<(Address, ScVal)>), SorochargeError> {
+    match credentials {
+        SorobanCredentials::Address(c) => Ok((
+            c.address.clone(),
+            vec![(c.address.clone(), c.signature.clone())],
+        )),
+        SorobanCredentials::AddressV2(c) => Ok((
+            c.address.clone(),
+            vec![(c.address.clone(), c.signature.clone())],
+        )),
+        SorobanCredentials::AddressWithDelegates(c) => {
+            let mut nodes = vec![(
+                c.address_credentials.address.clone(),
+                c.address_credentials.signature.clone(),
+            )];
+            nodes.extend(
+                c.delegates
+                    .iter()
+                    .map(|d| (d.address.clone(), d.signature.clone())),
+            );
+            Ok((c.address_credentials.address.clone(), nodes))
+        }
+        SorobanCredentials::SourceAccount => Err(SorochargeError::UnsupportedCredentialType),
+    }
+}
+
+/// Extracts a raw `(public_key, signature)` byte pair from the standard
+/// Stellar account signature shape (`ScVal::Vec([ScVal::Map({public_key,
+/// signature})])`), or `None` for anything else — the unsigned placeholder
+/// (`ScVal::Vec([])` or `ScVal::Void`), a custom `signatureScVal` shape this
+/// library doesn't interpret, or malformed data. `None` just means "this
+/// node contributes no verifiable signature," not a hard error: a
+/// `Delegated` entry with several nodes should still succeed if any other
+/// node is validly signed.
+fn extract_account_signature(scval: &ScVal) -> Option<([u8; 32], [u8; 64])> {
+    let ScVal::Vec(Some(vec)) = scval else {
+        return None;
+    };
+    let [ScVal::Map(Some(map))] = vec.0.as_slice() else {
+        return None;
+    };
+    let mut public_key: Option<[u8; 32]> = None;
+    let mut signature: Option<[u8; 64]> = None;
+    for entry in map.0.iter() {
+        let ScVal::Symbol(key) = &entry.key else {
+            continue;
+        };
+        let ScVal::Bytes(val) = &entry.val else {
+            continue;
+        };
+        let bytes: &[u8] = &val.0;
+        if key.0.to_utf8_string_lossy() == "public_key" {
+            public_key = bytes.try_into().ok();
+        } else if key.0.to_utf8_string_lossy() == "signature" {
+            signature = bytes.try_into().ok();
+        }
+    }
+    Some((public_key?, signature?))
+}
+
+fn is_valid_ed25519_signature(address: &Address, payload: &[u8; 32], scval: &ScVal) -> bool {
+    let ScAddress::Account(_) = address else {
+        return false;
+    };
+    let Some((public_key_bytes, signature_bytes)) = extract_account_signature(scval) else {
+        return false;
+    };
+    let Ok(verifying_key) = VerifyingKey::from_bytes(&public_key_bytes) else {
+        return false;
+    };
+    verifying_key
+        .verify(payload, &Signature::from_bytes(&signature_bytes))
+        .is_ok()
+}
+
+/// Verifies a signed charge entry against the charge it's expected to
+/// authorize, failing closed on the first mismatch, checked in this order:
+///
+/// 1. [`SorochargeError::ExpiredEntry`] — `valid_until_ledger` has passed
+///    `current_ledger`.
+/// 2. [`SorochargeError::UnexpectedInvocationShape`] — the entry doesn't
+///    authorize a single, bare SEP-41 `transfer(from, to, amount)` call.
+/// 3. [`SorochargeError::AssetMismatch`] — the asset contract differs.
+/// 4. [`SorochargeError::PayerMismatch`] — the authorizing address (the
+///    credential's address, which must also be the invocation's `from`)
+///    differs from `expected.payer`. This check is not in the CLAUDE.md
+///    section 5 checklist verbatim (which lists only asset/amount/recipient
+///    alongside expiry and signature), but omitting it would let any signed
+///    entry pass as long as its invocation happened to name the right
+///    asset/amount/recipient, regardless of whose key actually signed it —
+///    added per this project's brief to resolve spec ambiguity toward the
+///    more conservative reading.
+/// 5. [`SorochargeError::AmountMismatch`] — the amount differs.
+/// 6. [`SorochargeError::RecipientMismatch`] — the recipient differs.
+/// 7. [`SorochargeError::InvalidSignature`] — no signable node (the
+///    top-level address, or, for `Delegated`, any delegate) carries a valid
+///    ed25519 signature over the reconstructed `HashIdPreimage`. A
+///    `Delegated` entry's account-contract-specific signing *policy*
+///    (how many delegates must sign, or which) is unknowable here — this
+///    only proves at least one attached signature is genuine.
+///
+/// # Errors
+///
+/// Returns [`SorochargeError::UnsupportedCredentialType`] for
+/// `SOROBAN_CREDENTIALS_SOURCE_ACCOUNT`, which this library never signs and
+/// so never expects to verify either.
+pub fn verify_entry(
+    entry: &SignedEntry,
+    expected: &ChargeParams,
+    current_ledger: u32,
+    network_passphrase: &str,
+) -> Result<(), SorochargeError> {
+    let xdr_entry = entry.as_xdr();
+    let (authorizing_address, signable_nodes) =
+        authorizing_address_and_signable_nodes(&xdr_entry.credentials)?;
+
+    let (_, signature_expiration_ledger, _) =
+        crate::sign::credential_preimage_fields(&xdr_entry.credentials)?;
+    if signature_expiration_ledger <= current_ledger {
+        return Err(SorochargeError::ExpiredEntry {
+            valid_until_ledger: signature_expiration_ledger,
+            current_ledger,
+        });
+    }
+
+    let transfer = extract_transfer_args(&xdr_entry.root_invocation)?;
+
+    if transfer.asset_contract != expected.asset_contract {
+        return Err(SorochargeError::AssetMismatch);
+    }
+    if authorizing_address != expected.payer || transfer.from != expected.payer {
+        return Err(SorochargeError::PayerMismatch);
+    }
+    if transfer.amount != expected.amount {
+        return Err(SorochargeError::AmountMismatch);
+    }
+    if transfer.to != expected.recipient {
+        return Err(SorochargeError::RecipientMismatch);
+    }
+
+    let payload = signing_payload(
+        &xdr_entry.credentials,
+        &xdr_entry.root_invocation,
+        network_passphrase,
+    )?;
+    let has_valid_signature = signable_nodes
+        .iter()
+        .any(|(address, signature)| is_valid_ed25519_signature(address, &payload, signature));
+    if !has_valid_signature {
+        return Err(SorochargeError::InvalidSignature);
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sign::build_account_signature_scval;
+    use serde::Deserialize;
+    use stellar_xdr::{Limits, ReadXdr, SorobanAuthorizationEntry};
+
+    /// A fixture signed by the pinned `@stellar/stellar-sdk`'s own
+    /// `authorizeEntry`, reused here to prove `verify_entry` accepts real
+    /// reference-SDK output, not just entries this library produced itself.
+    #[derive(Deserialize)]
+    struct SignedFixture {
+        asset_contract: String,
+        payer: String,
+        recipient: String,
+        amount: String,
+        valid_until_ledger: u32,
+        network_passphrase: String,
+        signed_entry_xdr_base64: String,
+    }
+
+    fn load_signed_fixture(name: &str) -> SignedFixture {
+        let path = format!(
+            "{}/../../tests/golden_vectors/fixtures/{name}.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read fixture {path}: {e}"));
+        serde_json::from_str(&contents)
+            .unwrap_or_else(|e| panic!("failed to parse fixture {path}: {e}"))
+    }
+
+    struct Fixture {
+        signed: SignedEntry,
+        expected: ChargeParams,
+        network_passphrase: String,
+        valid_until_ledger: u32,
+    }
+
+    fn load() -> Fixture {
+        let fixture = load_signed_fixture("legacy_transfer_signed");
+        let xdr_entry = SorobanAuthorizationEntry::from_xdr_base64(
+            &fixture.signed_entry_xdr_base64,
+            Limits::none(),
+        )
+        .expect("fixture XDR should decode");
+        Fixture {
+            signed: SignedEntry(xdr_entry),
+            expected: ChargeParams {
+                asset_contract: fixture.asset_contract.parse().unwrap(),
+                amount: fixture.amount.parse().unwrap(),
+                payer: fixture.payer.parse().unwrap(),
+                recipient: fixture.recipient.parse().unwrap(),
+                valid_until_ledger: fixture.valid_until_ledger,
+            },
+            network_passphrase: fixture.network_passphrase,
+            valid_until_ledger: fixture.valid_until_ledger,
+        }
+    }
+
+    #[test]
+    fn accepts_a_valid_entry_signed_by_the_reference_sdk() {
+        let f = load();
+        let result = verify_entry(
+            &f.signed,
+            &f.expected,
+            f.valid_until_ledger - 1,
+            &f.network_passphrase,
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn rejects_an_expired_entry() {
+        let f = load();
+        let result = verify_entry(
+            &f.signed,
+            &f.expected,
+            f.valid_until_ledger,
+            &f.network_passphrase,
+        );
+        assert_eq!(
+            result,
+            Err(SorochargeError::ExpiredEntry {
+                valid_until_ledger: f.valid_until_ledger,
+                current_ledger: f.valid_until_ledger,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_asset_contract() {
+        let f = load();
+        let mut expected = f.expected;
+        expected.asset_contract =
+            ScAddress::Contract(stellar_xdr::ContractId(stellar_xdr::Hash([0x99; 32])));
+        let result = verify_entry(
+            &f.signed,
+            &expected,
+            f.valid_until_ledger - 1,
+            &f.network_passphrase,
+        );
+        assert_eq!(result, Err(SorochargeError::AssetMismatch));
+    }
+
+    #[test]
+    fn rejects_wrong_payer() {
+        let f = load();
+        let mut expected = f.expected;
+        expected.payer = "GCQJVJPUPJTVTABP7FK7RXBNFIKKLSM5EO7JP6DECJ77SOBUKWSPB64N"
+            .parse()
+            .unwrap();
+        let result = verify_entry(
+            &f.signed,
+            &expected,
+            f.valid_until_ledger - 1,
+            &f.network_passphrase,
+        );
+        assert_eq!(result, Err(SorochargeError::PayerMismatch));
+    }
+
+    #[test]
+    fn rejects_wrong_amount() {
+        let f = load();
+        let mut expected = f.expected;
+        expected.amount += 1;
+        let result = verify_entry(
+            &f.signed,
+            &expected,
+            f.valid_until_ledger - 1,
+            &f.network_passphrase,
+        );
+        assert_eq!(result, Err(SorochargeError::AmountMismatch));
+    }
+
+    #[test]
+    fn rejects_wrong_recipient() {
+        let f = load();
+        let mut expected = f.expected;
+        expected.recipient = ScAddress::Account(stellar_xdr::AccountId(
+            stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256([0x77; 32])),
+        ));
+        let result = verify_entry(
+            &f.signed,
+            &expected,
+            f.valid_until_ledger - 1,
+            &f.network_passphrase,
+        );
+        assert_eq!(result, Err(SorochargeError::RecipientMismatch));
+    }
+
+    #[test]
+    fn rejects_a_tampered_signature() {
+        let f = load();
+        let xdr_entry = f.signed.as_xdr().clone();
+        let SorobanCredentials::Address(mut creds) = xdr_entry.credentials.clone() else {
+            panic!("expected legacy Address credentials in this fixture");
+        };
+        let (public_key, mut signature) = extract_account_signature(&creds.signature)
+            .expect("fixture signature should already be well-formed");
+        signature[0] ^= 0xFF;
+        creds.signature = build_account_signature_scval(public_key, signature).unwrap();
+        let tampered = SignedEntry(SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::Address(creds),
+            root_invocation: xdr_entry.root_invocation,
+        });
+
+        let result = verify_entry(
+            &tampered,
+            &f.expected,
+            f.valid_until_ledger - 1,
+            &f.network_passphrase,
+        );
+        assert_eq!(result, Err(SorochargeError::InvalidSignature));
+    }
+
+    #[test]
+    fn rejects_an_invocation_that_is_not_a_bare_transfer() {
+        let f = load();
+        let xdr_entry = f.signed.as_xdr().clone();
+        let mut root_invocation = xdr_entry.root_invocation.clone();
+        // Smuggle in a sub-invocation alongside the transfer.
+        root_invocation.sub_invocations = vec![root_invocation.clone()].try_into().unwrap();
+        let tampered = SignedEntry(SorobanAuthorizationEntry {
+            credentials: xdr_entry.credentials,
+            root_invocation,
+        });
+
+        let result = verify_entry(
+            &tampered,
+            &f.expected,
+            f.valid_until_ledger - 1,
+            &f.network_passphrase,
+        );
+        assert_eq!(result, Err(SorochargeError::UnexpectedInvocationShape));
+    }
+}
