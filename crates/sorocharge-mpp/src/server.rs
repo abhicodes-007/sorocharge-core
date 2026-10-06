@@ -12,7 +12,9 @@
 //! [`MppServer::settle_credential`] alongside the received credential.
 
 use chrono::{DateTime, Utc};
-use sorocharge_signer::{verify_entry, Address, ChargeParams, SignedEntry, Signer};
+use sorocharge_signer::{
+    verify_entry, verify_transfer_effects, Address, ChargeParams, SignedEntry, Signer,
+};
 use stellar_xdr::{
     Hash as XdrHash, Limits, Preconditions, ReadXdr, ScAddress, SorobanCredentials,
     TransactionEnvelope,
@@ -402,6 +404,16 @@ impl<'a> MppServer<'a> {
                 reason: format!("simulation failed: {error}"),
             });
         }
+        verify_transfer_effects(
+            &simulation.events,
+            &params.asset_contract,
+            &params.payer,
+            &params.recipient,
+            params.amount,
+        )
+        .map_err(|e| MppError::VerificationFailed {
+            reason: e.to_string(),
+        })?;
 
         let response = if sponsored {
             let ScAddress::Account(server_account_id) = self.server_address() else {

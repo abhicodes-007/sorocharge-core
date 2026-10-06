@@ -40,6 +40,13 @@ pub enum SorochargeError {
     /// A signer's address matches no credential node (top-level address or
     /// delegate) in the entry being signed.
     NoMatchingCredentialNode,
+    /// A simulation's events could not be decoded, or a balance event lacks
+    /// the topics or data a transfer must carry.
+    SimulationEventsMalformed { reason: String },
+    /// The simulation shows a balance change other than the expected payment.
+    UnexpectedBalanceChange { reason: String },
+    /// The simulation does not show the expected payment transfer at all.
+    ExpectedTransferMissing,
     /// The `Signer` implementation returned an error while signing a preimage.
     SigningFailed { reason: String },
     /// Constructing or serializing an XDR structure failed.
@@ -77,6 +84,15 @@ impl fmt::Display for SorochargeError {
             Self::AmountMismatch => write!(f, "amount does not match expected charge"),
             Self::RecipientMismatch => write!(f, "recipient does not match expected charge"),
             Self::InvalidSignature => write!(f, "signature is invalid for the entry's credential"),
+            Self::SimulationEventsMalformed { reason } => {
+                write!(f, "simulation events malformed: {reason}")
+            }
+            Self::UnexpectedBalanceChange { reason } => {
+                write!(f, "unexpected balance change in simulation: {reason}")
+            }
+            Self::ExpectedTransferMissing => {
+                write!(f, "simulation does not show the expected transfer")
+            }
             Self::NoMatchingCredentialNode => write!(
                 f,
                 "signer's address matches no credential node in this entry"

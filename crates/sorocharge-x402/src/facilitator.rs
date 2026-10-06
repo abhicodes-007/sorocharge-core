@@ -10,7 +10,9 @@
 
 use std::collections::BTreeMap;
 
-use sorocharge_signer::{verify_entry, Address, ChargeParams, SignedEntry, Signer};
+use sorocharge_signer::{
+    verify_entry, verify_transfer_effects, Address, ChargeParams, SignedEntry, Signer,
+};
 use stellar_xdr::{
     AccountId, Limits, PublicKey, ReadXdr, ScAddress, SequenceNumber, SorobanCredentials,
     TransactionEnvelope, TransactionExt, Uint256,
@@ -226,6 +228,16 @@ impl<'a> Facilitator<'a> {
                 reason: format!("simulation failed: {error}"),
             });
         }
+        verify_transfer_effects(
+            &simulation.events,
+            &params.asset_contract,
+            &params.payer,
+            &params.recipient,
+            params.amount,
+        )
+        .map_err(|e| X402Error::InvalidPaymentPayload {
+            reason: e.to_string(),
+        })?;
 
         Ok((tx, auth_entry, params))
     }
@@ -312,6 +324,22 @@ impl<'a> Facilitator<'a> {
             return Ok(SettlementResponse {
                 success: false,
                 error_reason: Some(format!("settlement simulation failed: {error}")),
+                payer: Some(params.payer.to_string()),
+                transaction: String::new(),
+                network,
+                amount: None,
+            });
+        }
+        if let Err(e) = verify_transfer_effects(
+            &simulation.events,
+            &params.asset_contract,
+            &params.payer,
+            &params.recipient,
+            params.amount,
+        ) {
+            return Ok(SettlementResponse {
+                success: false,
+                error_reason: Some(format!("settlement effects rejected: {e}")),
                 payer: Some(params.payer.to_string()),
                 transaction: String::new(),
                 network,

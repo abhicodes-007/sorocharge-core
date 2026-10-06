@@ -17,11 +17,13 @@
 
 #![deny(unsafe_code)]
 
+mod effects;
 mod entry;
 mod error;
 mod sign;
 mod verify;
 
+pub use effects::verify_transfer_effects;
 pub use entry::{build_charge_entry, Address, ChargeParams, CredentialKind, UnsignedEntry};
 pub use error::SorochargeError;
 pub use sign::{sign_entry, SignedEntry, Signer};
