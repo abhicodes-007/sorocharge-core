@@ -165,7 +165,14 @@ impl<'a> MppClient<'a> {
             })?
             .sequence;
         let seconds_until_expiry = (expires_at - Utc::now()).num_seconds().max(0) as u64;
-        let ledger_timeout = seconds_until_expiry.div_ceil(DEFAULT_ESTIMATED_LEDGER_SECONDS);
+        // Half the spec's allowance. The server re-derives its bound from its own
+        // clock and the live ledger; if ledgers close slower than the 5s default,
+        // a full-allowance expiry fails that check. The margin keeps the
+        // expiry inside the bound (and shorter, so less exposed) at the cost of
+        // a shorter authorization window.
+        let ledger_timeout = seconds_until_expiry
+            .div_ceil(DEFAULT_ESTIMATED_LEDGER_SECONDS)
+            .div_ceil(2);
         let valid_until_ledger =
             current_ledger.saturating_add(u32::try_from(ledger_timeout).unwrap_or(u32::MAX));
 

@@ -14,11 +14,12 @@
 //!   SOROCHARGE_TESTNET_AMOUNT                 - (optional) base units, default "1000000"
 //!   SOROCHARGE_RESOURCE_BIND                  - (optional) default "127.0.0.1:8403"
 //!   SOROCHARGE_TESTNET_RPC_URL                - (optional) default https://soroban-testnet.stellar.org
+//!   SOROCHARGE_MPP_FEE_PAYER                  - (optional) "false" for unsponsored, client-paid fees; default sponsored
 //!
 //! Run with:
 //!   cargo run --example resource_server_mpp -p sorocharge-mpp
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,7 +34,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL;
 use base64::Engine;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ed25519_dalek::{Signer as DalekSigner, SigningKey};
-use sorocharge_mpp::{ChargeRequest, Credential, MethodDetails, MppServer, MppServerConfig};
+use sorocharge_mpp::{
+    ChargeRequest, Credential, MethodDetails, MppServer, MppServerConfig, Payload,
+};
 use sorocharge_signer::{Address, Signer, SorochargeError};
 use stellar_xdr::{AccountId, PublicKey, ScAddress, Uint256};
 
@@ -79,6 +82,9 @@ struct AppState {
     /// Challenge id -> the request it was issued for. Entries are removed
     /// on first use, so a credential can only ever settle once.
     issued: Mutex<HashMap<String, (ChargeRequest, DateTime<Utc>)>>,
+    /// Push-mode transaction hashes already settled. The spec requires a
+    /// server to reject a hash it has consumed, even on a fresh challenge.
+    consumed_hashes: Mutex<HashSet<String>>,
     counter: AtomicU64,
 }
 
@@ -165,11 +171,29 @@ async fn resource(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
         NETWORK_PASSPHRASE.to_string(),
         MppServerConfig::default(),
     );
+    let pushed_hash = match &credential.payload {
+        Payload::Hash { hash } => Some(hash.clone()),
+        Payload::Transaction { .. } => None,
+    };
+    let already_consumed = pushed_hash.as_ref().is_some_and(|h| {
+        state
+            .consumed_hashes
+            .lock()
+            .expect("hash store poisoned")
+            .contains(h)
+    });
     match server
-        .settle_credential(&credential, &expected, Utc::now(), false)
+        .settle_credential(&credential, &expected, Utc::now(), already_consumed)
         .await
     {
         Ok(receipt) => {
+            if let Some(hash) = pushed_hash {
+                state
+                    .consumed_hashes
+                    .lock()
+                    .expect("hash store poisoned")
+                    .insert(hash);
+            }
             let encoded =
                 BASE64URL.encode(serde_json::to_vec(&receipt).expect("serialize receipt"));
             let mut out = HeaderMap::new();
@@ -198,6 +222,9 @@ async fn main() {
         env::var("SOROCHARGE_RESOURCE_BIND").unwrap_or_else(|_| "127.0.0.1:8403".to_string());
     let rpc_url = env::var("SOROCHARGE_TESTNET_RPC_URL")
         .unwrap_or_else(|_| "https://soroban-testnet.stellar.org".to_string());
+    let fee_payer = env::var("SOROCHARGE_MPP_FEE_PAYER")
+        .map(|v| v != "false")
+        .unwrap_or(true);
 
     let signer = KeypairSigner::from_secret_seed(&facilitator_seed);
     let charge = ChargeRequest {
@@ -208,7 +235,7 @@ async fn main() {
         external_id: None,
         method_details: MethodDetails {
             network: "stellar:testnet".to_string(),
-            fee_payer: true,
+            fee_payer,
         },
     };
 
@@ -217,6 +244,7 @@ async fn main() {
         signer,
         charge,
         issued: Mutex::new(HashMap::new()),
+        consumed_hashes: Mutex::new(HashSet::new()),
         counter: AtomicU64::new(0),
     });
 
