@@ -428,11 +428,19 @@ impl<'a> MppServer<'a> {
                     ),
                 });
             }
+            let soroban_data = stellar_xdr::SorobanTransactionData::from_xdr_base64(
+                &simulation.transaction_data,
+                Limits::none(),
+            )
+            .map_err(|e| MppError::XdrDecodingFailed {
+                reason: e.to_string(),
+            })?;
             let rebuilt = rebuild_for_settlement(
                 &tx,
                 server_account_id,
                 u32::try_from(fee).unwrap_or(u32::MAX),
                 next_seq,
+                soroban_data,
             );
             let network_id = network_id_hash(&self.network_passphrase);
             let signed_envelope = sign_transaction(rebuilt, self.signer, network_id)?;

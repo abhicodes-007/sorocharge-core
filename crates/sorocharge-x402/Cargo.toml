@@ -20,4 +20,5 @@ serde_json = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 ed25519-dalek = { workspace = true }
+axum = { workspace = true }
 stellar-strkey = { workspace = true }

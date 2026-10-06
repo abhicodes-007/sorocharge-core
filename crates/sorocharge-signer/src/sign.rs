@@ -15,7 +15,7 @@ use crate::error::SorochargeError;
 ///
 /// Implementations wrap a signing key already in memory (or a remote
 /// signing callback); this library does not manage keys.
-pub trait Signer {
+pub trait Signer: Send + Sync {
     /// Signs `preimage` — the 32-byte sha256 digest of the entry's
     /// `HashIdPreimage` — and returns the raw 64-byte ed25519 signature.
     fn sign_preimage(&self, preimage: &[u8]) -> Result<[u8; 64], SorochargeError>;

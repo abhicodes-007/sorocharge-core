@@ -220,6 +220,7 @@ pub(crate) fn rebuild_for_settlement(
     source: AccountId,
     fee: u32,
     seq_num: SequenceNumber,
+    soroban_data: SorobanTransactionData,
 ) -> Transaction {
     let AccountId(PublicKey::PublicKeyTypeEd25519(source_key)) = source;
     Transaction {
@@ -229,7 +230,7 @@ pub(crate) fn rebuild_for_settlement(
         cond: Preconditions::None,
         memo: Memo::None,
         operations: tx.operations.clone(),
-        ext: TransactionExt::V0,
+        ext: TransactionExt::V1(soroban_data),
     }
 }
 
