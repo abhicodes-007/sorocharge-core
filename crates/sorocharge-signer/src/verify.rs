@@ -136,10 +136,19 @@ fn is_valid_ed25519_signature(address: &Address, payload: &[u8; 32], scval: &ScV
 ///
 /// 1. [`SorochargeError::ExpiredEntry`] — `valid_until_ledger` has passed
 ///    `current_ledger`.
-/// 2. [`SorochargeError::UnexpectedInvocationShape`] — the entry doesn't
+/// 2. [`SorochargeError::ExpirationExceedsAllowance`] — the entry's own
+///    `signature_expiration_ledger` is later than `expected.valid_until_ledger`.
+///    Checking only "not yet expired" (the previous check) bounds how late
+///    is too late; it never bounded how *long-lived* an authorization the
+///    caller is willing to accept. Without this, a payer could attach an
+///    authorization valid for far longer than the payee asked for, and
+///    verify_entry would pass it as long as it hadn't expired yet — found
+///    reviewing a downstream binding that needed to read this field and
+///    found nothing enforced it.
+/// 3. [`SorochargeError::UnexpectedInvocationShape`] — the entry doesn't
 ///    authorize a single, bare SEP-41 `transfer(from, to, amount)` call.
-/// 3. [`SorochargeError::AssetMismatch`] — the asset contract differs.
-/// 4. [`SorochargeError::PayerMismatch`] — the authorizing address (the
+/// 4. [`SorochargeError::AssetMismatch`] — the asset contract differs.
+/// 5. [`SorochargeError::PayerMismatch`] — the authorizing address (the
 ///    credential's address, which must also be the invocation's `from`)
 ///    differs from `expected.payer`. This check is not in the CLAUDE.md
 ///    section 5 checklist verbatim (which lists only asset/amount/recipient
@@ -148,9 +157,9 @@ fn is_valid_ed25519_signature(address: &Address, payload: &[u8; 32], scval: &ScV
 ///    asset/amount/recipient, regardless of whose key actually signed it —
 ///    added per this project's brief to resolve spec ambiguity toward the
 ///    more conservative reading.
-/// 5. [`SorochargeError::AmountMismatch`] — the amount differs.
-/// 6. [`SorochargeError::RecipientMismatch`] — the recipient differs.
-/// 7. [`SorochargeError::InvalidSignature`] — no signable node (the
+/// 6. [`SorochargeError::AmountMismatch`] — the amount differs.
+/// 7. [`SorochargeError::RecipientMismatch`] — the recipient differs.
+/// 8. [`SorochargeError::InvalidSignature`] — no signable node (the
 ///    top-level address, or, for `Delegated`, any delegate) carries a valid
 ///    ed25519 signature over the reconstructed `HashIdPreimage`. A
 ///    `Delegated` entry's account-contract-specific signing *policy*
@@ -178,6 +187,12 @@ pub fn verify_entry(
         return Err(SorochargeError::ExpiredEntry {
             valid_until_ledger: signature_expiration_ledger,
             current_ledger,
+        });
+    }
+    if signature_expiration_ledger > expected.valid_until_ledger {
+        return Err(SorochargeError::ExpirationExceedsAllowance {
+            signature_expiration_ledger,
+            allowed_until_ledger: expected.valid_until_ledger,
         });
     }
 
@@ -297,6 +312,26 @@ mod tests {
             Err(SorochargeError::ExpiredEntry {
                 valid_until_ledger: f.valid_until_ledger,
                 current_ledger: f.valid_until_ledger,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_an_entry_valid_longer_than_the_caller_allows() {
+        let f = load();
+        let mut expected = f.expected;
+        expected.valid_until_ledger = f.valid_until_ledger - 1;
+        let result = verify_entry(
+            &f.signed,
+            &expected,
+            f.valid_until_ledger - 2,
+            &f.network_passphrase,
+        );
+        assert_eq!(
+            result,
+            Err(SorochargeError::ExpirationExceedsAllowance {
+                signature_expiration_ledger: f.valid_until_ledger,
+                allowed_until_ledger: f.valid_until_ledger - 1,
             })
         );
     }

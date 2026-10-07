@@ -23,6 +23,13 @@ pub enum SorochargeError {
         valid_until_ledger: u32,
         current_ledger: u32,
     },
+    /// The entry's own `signature_expiration_ledger` is later than the
+    /// caller's `expected.valid_until_ledger` — it isn't expired, but it is
+    /// valid for longer than the caller said it would accept.
+    ExpirationExceedsAllowance {
+        signature_expiration_ledger: u32,
+        allowed_until_ledger: u32,
+    },
     /// The entry's invocation is not a SEP-41 `transfer(from, to, amount)`
     /// call on a single contract, so there is nothing meaningful to compare
     /// its asset/payer/amount/recipient against.
@@ -74,6 +81,13 @@ impl fmt::Display for SorochargeError {
             } => write!(
                 f,
                 "entry expired: valid until ledger {valid_until_ledger}, current ledger {current_ledger}"
+            ),
+            Self::ExpirationExceedsAllowance {
+                signature_expiration_ledger,
+                allowed_until_ledger,
+            } => write!(
+                f,
+                "entry's expiration ledger {signature_expiration_ledger} exceeds the allowed {allowed_until_ledger}"
             ),
             Self::UnexpectedInvocationShape => write!(
                 f,

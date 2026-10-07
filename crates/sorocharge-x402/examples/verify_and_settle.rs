@@ -144,6 +144,13 @@ async fn main() {
         .expect("getLatestLedger failed")
         .sequence;
 
+    // Derived from max_timeout_seconds below the same way X402Client does:
+    // the facilitator caps the entry's expiration at
+    // currentLedger + ceil(maxTimeoutSeconds / 5), so building it with an
+    // unrelated expiration here would fail that check.
+    const MAX_TIMEOUT_SECONDS: u64 = 60;
+    let valid_until_ledger = current_ledger + u32::try_from(MAX_TIMEOUT_SECONDS.div_ceil(5)).unwrap();
+
     let params = ChargeParams {
         asset_contract: asset_contract_str
             .parse()
@@ -153,7 +160,7 @@ async fn main() {
             .expect("SOROCHARGE_TESTNET_AMOUNT must be an integer"),
         payer: payer.address(),
         recipient: facilitator_signer.address(),
-        valid_until_ledger: current_ledger + 200,
+        valid_until_ledger,
     };
 
     println!(
@@ -174,7 +181,7 @@ async fn main() {
         amount: amount_str.clone(),
         asset: asset_contract_str.clone(),
         pay_to: params.recipient.to_string(),
-        max_timeout_seconds: 60,
+        max_timeout_seconds: MAX_TIMEOUT_SECONDS,
         extra: StellarExtra {
             are_fees_sponsored: true,
         },

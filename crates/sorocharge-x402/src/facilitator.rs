@@ -26,9 +26,13 @@ use crate::types::{
     VerifyResponse,
 };
 
+/// Fallback average Stellar ledger close time, used to convert
+/// `maxTimeoutSeconds` into a ledger count when a live network estimate
+/// isn't available. Matches the spec's own fallback.
+const DEFAULT_ESTIMATED_LEDGER_SECONDS: u64 = 5;
 /// The default safety ceiling on a settlement's simulation-derived fee, per
 /// the spec's suggested default.
-pub const DEFAULT_MAX_TRANSACTION_FEE_STROOPS: i64 = 50_000;
+const DEFAULT_MAX_TRANSACTION_FEE_STROOPS: i64 = 50_000;
 /// The spec's required minimum inclusion buffer added to the simulated
 /// resource fee.
 pub const MIN_INCLUSION_BUFFER_STROOPS: i64 = 100;
@@ -199,12 +203,23 @@ impl<'a> Facilitator<'a> {
             })?
             .sequence;
 
+        // The spec: "the auth entry expiration ledger MUST NOT exceed
+        // currentLedger + ceil(maxTimeoutSeconds / estimatedLedgerSeconds)."
+        // This is also what verify_entry's ExpirationExceedsAllowance check
+        // enforces against expected.valid_until_ledger, so it has to be the
+        // real cap, not a placeholder.
+        let max_timeout_ledgers = requirements
+            .max_timeout_seconds
+            .div_ceil(DEFAULT_ESTIMATED_LEDGER_SECONDS);
+        let valid_until_ledger =
+            current_ledger.saturating_add(u32::try_from(max_timeout_ledgers).unwrap_or(u32::MAX));
+
         let params = ChargeParams {
             asset_contract,
             amount,
             payer: transfer.from.clone(),
             recipient,
-            valid_until_ledger: 0, // not used by verify_entry beyond the signed entry's own field
+            valid_until_ledger,
         };
         verify_entry(
             &SignedEntry::from_xdr(auth_entry.clone()),

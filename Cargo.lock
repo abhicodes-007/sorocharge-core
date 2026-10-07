@@ -2082,7 +2082,7 @@ dependencies = [
 
 [[package]]
 name = "sorocharge-mpp"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2102,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "sorocharge-signer"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
@@ -2115,7 +2115,7 @@ dependencies = [
 
 [[package]]
 name = "sorocharge-x402"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "axum",
  "base64 0.23.1",

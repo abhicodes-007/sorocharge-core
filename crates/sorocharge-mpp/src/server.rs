@@ -27,6 +27,9 @@ use crate::tx::{parse_payment_transaction, rebuild_for_settlement, sign_transact
 use crate::types::{ChargeRequest, Credential, Payload, Receipt};
 
 const DEFAULT_ESTIMATED_LEDGER_SECONDS: u64 = 5;
+/// Fallback challenge validity when `expires` is absent, matching the
+/// spec's own DEFAULT_CHALLENGE_EXPIRY.
+const DEFAULT_CHALLENGE_EXPIRY_SECONDS: u64 = 300;
 
 /// Server configuration. The MPP spec (unlike x402's `exact` scheme on
 /// Stellar) does not mandate a specific default fee ceiling — it only says
@@ -328,28 +331,30 @@ impl<'a> MppServer<'a> {
             })?
             .sequence;
 
-        let (credential_address, signature_expiration_ledger) =
+        let (credential_address, _signature_expiration_ledger) =
             legacy_credential_fields(&auth_entry.credentials)?;
 
-        if let Some(expires_at) = expires_at {
-            let seconds_until_expiry = (expires_at - Utc::now()).num_seconds().max(0) as u64;
-            let ledger_timeout = seconds_until_expiry.div_ceil(DEFAULT_ESTIMATED_LEDGER_SECONDS);
-            let max_allowed_ledger =
-                current_ledger.saturating_add(u32::try_from(ledger_timeout).unwrap_or(u32::MAX));
-            if signature_expiration_ledger > max_allowed_ledger {
-                return Err(MppError::VerificationFailed {
-                    reason: "authorization entry expiration exceeds the challenge's allowance"
-                        .to_string(),
-                });
-            }
-        }
+        // The spec: the auth entry expiration MUST NOT exceed
+        // currentLedger + ceil((expires-now) / DEFAULT_LEDGER_CLOSE_TIME).
+        // When the challenge omits `expires`, clients default to
+        // DEFAULT_CHALLENGE_EXPIRY (5 minutes); the server caps against
+        // that same default rather than skipping the check. This cap is
+        // what verify_entry's ExpirationExceedsAllowance check enforces
+        // against expected.valid_until_ledger, so it has to be the real
+        // value, not a placeholder.
+        let seconds_until_expiry = expires_at
+            .map(|e| (e - Utc::now()).num_seconds().max(0) as u64)
+            .unwrap_or(DEFAULT_CHALLENGE_EXPIRY_SECONDS);
+        let ledger_timeout = seconds_until_expiry.div_ceil(DEFAULT_ESTIMATED_LEDGER_SECONDS);
+        let valid_until_ledger =
+            current_ledger.saturating_add(u32::try_from(ledger_timeout).unwrap_or(u32::MAX));
 
         let params = ChargeParams {
             asset_contract: asset_contract.clone(),
             amount,
             payer: credential_address,
             recipient: recipient.clone(),
-            valid_until_ledger: 0,
+            valid_until_ledger,
         };
         verify_entry(
             &SignedEntry::from_xdr(auth_entry.clone()),
