@@ -149,7 +149,8 @@ async fn main() {
     // currentLedger + ceil(maxTimeoutSeconds / 5), so building it with an
     // unrelated expiration here would fail that check.
     const MAX_TIMEOUT_SECONDS: u64 = 60;
-    let valid_until_ledger = current_ledger + u32::try_from(MAX_TIMEOUT_SECONDS.div_ceil(5)).unwrap();
+    let valid_until_ledger =
+        current_ledger + u32::try_from(MAX_TIMEOUT_SECONDS.div_ceil(5)).unwrap();
 
     let params = ChargeParams {
         asset_contract: asset_contract_str
